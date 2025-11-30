@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 st.set_page_config(page_title="만능 AI 에이전트", layout="wide")
-st.title("🤖 만능 AI 에이전트 (파일 업로드 기능 추가됨)")
+st.title("🤖 만능 AI 에이전트 (멀티모달 지원)")
 
 # API 키 가져오기
 api_key = st.secrets.get("AZURE_OAI_KEY", os.getenv("AZURE_OAI_KEY"))
@@ -60,10 +60,9 @@ def get_current_time(location):
 # ---------------------------------------------------------
 @st.cache_resource
 def create_assistant():
-    # Assistant 생성 (파일은 메시지 레벨에서 첨부하므로 여기선 기본 설정만)
     assistant = client.beta.assistants.create(
-        name="Streamlit File Assistant",
-        instructions="당신은 데이터 전문가입니다. 업로드된 파일이 있다면 code_interpreter나 file_search를 사용해 내용을 분석하세요.",
+        name="Streamlit Multi-Modal Bot",
+        instructions="당신은 데이터 전문가이자 비전 능력을 가진 AI입니다. 이미지가 주어지면 내용을 설명하고, 데이터 파일이 주어지면 분석하세요.",
         model="gpt-4o-mini", 
         tools=[
             {"type": "code_interpreter"}, 
@@ -80,20 +79,26 @@ if "assistant" not in st.session_state:
     st.session_state.messages = [] 
 
 # ---------------------------------------------------------
-# 4. 사이드바: 파일 업로드 UI [새로 추가된 부분 ⭐]
+# 4. 사이드바: 파일 업로드 UI
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("📂 파일 업로드")
-    uploaded_file = st.file_uploader("AI에게 분석시킬 파일을 올리세요", type=["txt", "csv", "xlsx", "pdf", "png", "jpg"])
-    
-    st.info("💡 파일을 올린 후 채팅창에 '이 파일 분석해줘'라고 입력하세요.")
+    uploaded_file = st.file_uploader("이미지나 문서를 올리세요", type=["txt", "csv", "xlsx", "pdf", "png", "jpg", "jpeg", "gif"])
+    st.info("💡 파일을 올린 후 채팅창에 질문을 입력하세요.")
 
 # ---------------------------------------------------------
 # 5. 채팅 인터페이스
 # ---------------------------------------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        # 텍스트가 리스트(멀티모달)일 수도 있고 문자열일 수도 있음
+        if isinstance(msg["content"], list):
+            for content_part in msg["content"]:
+                if content_part["type"] == "text":
+                    st.markdown(content_part["text"])
+        else:
+            st.markdown(msg["content"])
+            
         if "images" in msg:
             for img_data in msg["images"]:
                 st.image(img_data)
@@ -106,34 +111,48 @@ if prompt := st.chat_input("메시지를 입력하세요..."):
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # 2. 파일 처리 로직 [새로 추가된 부분 ⭐]
-    msg_params = {"thread_id": st.session_state.thread.id, "role": "user", "content": prompt}
-    
-    # 사용자가 파일을 업로드 했다면 Azure에 올리고 메시지에 첨부
+    # 2. 파일 처리 로직 (이미지 vs 문서 분기 처리)
+    msg_content = prompt
+    msg_attachments = []
+
     if uploaded_file:
-        with st.spinner("파일을 Azure OpenAI에 업로드 중..."):
-            # Streamlit의 파일 객체를 Azure가 좋아하는 형태로 업로드
-            # uploaded_file은 BytesIO 형태이므로 바로 전달 가능
+        with st.spinner("파일 업로드 및 처리 중..."):
             file_response = client.files.create(
                 file=uploaded_file,
                 purpose="assistants"
             )
+            file_id = file_response.id
+            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+
+            # [이미지 파일] -> Vision (Content에 포함)
+            if file_ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
+                msg_content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_file", "image_file": {"file_id": file_id}}
+                ]
+                st.toast(f"🖼️ 이미지 분석 모드: {uploaded_file.name}")
             
-            # 메시지에 첨부 (Code Interpreter와 File Search 모두 사용 가능하게 설정)
-            msg_params["attachments"] = [
-                {
-                    "file_id": file_response.id, 
-                    "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]
-                }
-            ]
-            st.toast(f"파일이 첨부되었습니다: {uploaded_file.name}")
+            # [문서 파일] -> Tools (Attachments에 포함)
+            else:
+                msg_attachments = [
+                    {
+                        "file_id": file_id, 
+                        "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]
+                    }
+                ]
+                st.toast(f"📄 문서 분석 모드: {uploaded_file.name}")
 
     # 3. 메시지 전송
-    client.beta.threads.messages.create(**msg_params)
+    client.beta.threads.messages.create(
+        thread_id=st.session_state.thread.id,
+        role="user",
+        content=msg_content,
+        attachments=msg_attachments
+    )
 
     # 4. 실행 및 폴링
     with st.chat_message("assistant"):
-        status_box = st.status("AI가 생각 중입니다...", expanded=True)
+        status_box = st.status("AI가 처리 중입니다...", expanded=True)
         
         run = client.beta.threads.runs.create(thread_id=st.session_state.thread.id, assistant_id=st.session_state.assistant.id)
         
